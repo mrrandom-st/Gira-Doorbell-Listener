@@ -15,13 +15,13 @@
 // ======================================================
 
 // ===================== USER CONFIG =====================
-static const char* WIFI_SSID = "R2DLan";
-static const char* WIFI_PASS = "#Stregner18!";
+static const char* WIFI_SSID = "";
+static const char* WIFI_PASS = "";
 
-static const char* MQTT_HOST = "192.168.2.142";
+static const char* MQTT_HOST = "";
 static const uint16_t MQTT_PORT = 1885;
-static const char* MQTT_USER = "randommqtt";
-static const char* MQTT_PASS = "cH1Ll0U7";
+static const char* MQTT_USER = "";
+static const char* MQTT_PASS = "";
 
 static const char* TOPIC_EVENT  = "home/doorbell/event";
 static const char* TOPIC_STATUS = "home/doorbell/status";
