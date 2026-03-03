@@ -15,16 +15,12 @@
 #include <PubSubClient.h>
 
 // ===================== USER CONFIG =====================
-static const char* WIFI_SSID = "";
-static const char* WIFI_PASS = "";
+#include "config.h"
 
-static const char* MQTT_HOST = "";
-static const uint16_t MQTT_PORT = 1885;
-static const char* MQTT_USER = "";
-static const char* MQTT_PASS = "";
+#ifndef WIFI_SSID
+#error "Bitte config.h anlegen (Kopie von config.example.h) und WIFI/MQTT Werte setzen."
+#endif
 
-static const char* TOPIC_EVENT  = "home/doorbell/event";
-static const char* TOPIC_STATUS = "home/doorbell/status";
 
 // ===================== DISPLAY CONFIG =====================
 #define BG_COLOR    TFT_BLACK
