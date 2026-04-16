@@ -1,15 +1,14 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
 #include <PubSubClient.h>
 
 #include "driver/i2s.h"
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <math.h> // Für RMS (sqrtf) und Glocken-Animation (sin)
 
-// ===================== USER CONFIG =====================
-#include "config.h"
+#include "config.h" // Hier liegen WIFI_SSID, WIFI_PASS, MQTT_HOST, etc.
 
 #ifndef WIFI_SSID
 #error "Bitte config.h anlegen (Kopie von config.example.h) und WIFI/MQTT Werte setzen."
@@ -21,43 +20,61 @@
 #define OLED_RESET -1
 Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, OLED_RESET);
 
-#define I2C_SDA 21
-#define I2C_SCL 22
+// S3-kompatible I2C Pins
+#define I2C_SDA 8
+#define I2C_SCL 9
 
 // ===================== I2S / INMP441 =====================
-#define I2S_WS   25
-#define I2S_SCK  32
-#define I2S_SD   33
+#define I2S_WS 4
+#define I2S_SCK 5
+#define I2S_SD 6
 #define I2S_PORT I2S_NUM_0
 
-// ===================== DSP / Trigger Test =====================
+// ===================== DSP / Trigger =====================
 static const float FS = 16000.0f;
-static const int   N  = 512;
+static const int N = 512;
 
-// Lautstärke: eher „niedrig empfindlich“ = höherer Gate-Wert
-static int   SHIFT      = 16;
-static int32_t peakGate = 450;     // <- deine gute Grundlage beibehalten
-static uint32_t cooldownMs = 1200;
-static int tfNeed = 2;             // ben. aufeinanderfolgende tonal-Frames
+// 🔥 DEINE PERFEKTIONIERTEN WERTE 🔥
+static int SHIFT = 16;
+static int32_t peakGate = 2200;
+static uint32_t cooldownMs = 3000;
+static int tfNeed = 3;
 
-// ===================== GOERTZEL-FREQUENZEN (NUR RELEVANT GEÄNDERT) =====================
-// Aus FFT: dominante Bereiche ~550 Hz, ~1645 Hz (stärkster), ~2065 Hz.
-// Wir nehmen je Bereich ein kleines Band (± ~30..50 Hz), damit Drift/Verzerrung nicht stört.
+static float domThr = 1.50f;
+static float peakThr = 0.45f;
+
+// ===================== GOERTZEL-FREQUENZEN =====================
 static const int FCNT = 9;
 static const float F[FCNT] = {
-  520, 550, 580,      // Band A ~550
-  1600, 1645, 1690,   // Band B ~1645 (Hauptton)
-  2020, 2065, 2110    // Band C ~2065
+  520, 550, 580, // B1: Sprache/TV
+  1600, 1645, 1690, // B2: Klingel Oberton (Index 3, 4, 5)
+  2020, 2065, 2110 // B3: Klingel Hauptton (Index 6, 7, 8)
 };
 
-// Diese Schwellen bleiben als Tuning-Parameter
-static float domThr  = 1.70f;
-static float peakThr = 0.24f;
+// ===================== MQTT Topics =====================
+static const char* TOPIC_CFG_PEAKGATE = "home/doorbell/cfg/peakGate";
+static const char* TOPIC_CFG_TFNEED = "home/doorbell/cfg/tfNeed";
+static const char* TOPIC_CMD_RECORD = "home/doorbell/cmd/record";
+static const char* TOPIC_RECORD_DATA = "home/doorbell/record_data";
+// (Stelle sicher, dass TOPIC_EVENT und TOPIC_STATUS in der config.h sind!)
 
-// ===================== Networking =====================
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
-WebServer server(80);
+
+// ===================== Recording State =====================
+struct RecordEntry {
+  int32_t peak;
+  float bestF;
+  float dom;
+  float pk;
+  bool tonal;
+};
+
+static bool isRecording = false;
+static uint32_t recordStartTime = 0;
+static uint32_t lastRecordSample = 0;
+static RecordEntry recs[20];
+static int recCount = 0;
 
 // ===================== Goertzel =====================
 struct GoertzelBin {
@@ -82,66 +99,111 @@ static float goertzel_mag2(const int32_t* x, const GoertzelBin& b) {
   for (int i = 0; i < N; i++) {
     float s = (float)x[i] + b.coeff * s_prev - s_prev2;
     s_prev2 = s_prev;
-    s_prev  = s;
+    s_prev = s;
   }
   float real = s_prev - s_prev2 * b.cosw;
   float imag = s_prev2 * b.sinw;
   return real * real + imag * imag;
 }
 
-// ===================== Audio buffers =====================
+// ===================== Buffers =====================
 static int32_t rawBuf[N];
 static int32_t xBuf[N];
+static float mags[FCNT];
+
+// ===================== Runtime values =====================
+static int32_t lastPeak = 0;
+static float lastBestF = -1.0f;
+static float lastDom = 0.0f;
+static float lastPk = 0.0f;
+static bool lastTrig = false;
+
+// ===== Klingel-Pattern =====
+static int toneHistory[6] = {0};
+static int tonePos = 0;
 
 // ===================== Helpers =====================
 static bool wifiOk() { return WiFi.status() == WL_CONNECTED; }
 static bool mqttOk() { return mqtt.connected(); }
 
 static void wifiEnsure() {
-  if (wifiOk()) return;
-  static bool started = false;
-  if (!started) {
+  if (!wifiOk()) {
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    started = true;
+  }
+}
+
+static void publishStatus() {
+  if (!mqttOk()) return;
+  char buf[320];
+  snprintf(buf, sizeof(buf),
+    "{\"peak\":%ld,\"bestF\":%.0f,\"dom\":%.2f,\"pk\":%.2f,\"peakGate\":%ld,\"tfNeed\":%d,\"cooldownMs\":%u}",
+    (long)lastPeak, lastBestF, lastDom, lastPk, (long)peakGate, tfNeed, (unsigned)cooldownMs);
+  mqtt.publish(TOPIC_STATUS, buf, true);
+}
+
+static void publishTrig() {
+  if (!mqttOk()) return;
+  char buf[128];
+  snprintf(buf, sizeof(buf), "{\"trigger\":1,\"peak\":%ld,\"freq\":%.0f}", (long)lastPeak, lastBestF);
+  mqtt.publish(TOPIC_EVENT, buf, false);
+}
+
+static void sendRecordData() {
+  if (!mqttOk()) return;
+  String json = "[";
+  for (int i = 0; i < recCount; i++) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"p\":%ld,\"f\":%.0f,\"d\":%.2f,\"k\":%.2f,\"t\":%d}",
+      recs[i].peak, recs[i].bestF, recs[i].dom, recs[i].pk, recs[i].tonal ? 1 : 0);
+    json += buf;
+    if (i < recCount - 1) json += ",";
+  }
+  json += "]";
+  mqtt.publish(TOPIC_RECORD_DATA, json.c_str(), false);
+  mqtt.publish(TOPIC_CMD_RECORD, "0", true);
+}
+
+static void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String v = "";
+  for (unsigned int i = 0; i < length; i++) v += (char)payload[i];
+  String t = String(topic);
+  int val = v.toInt();
+
+  // START RECORDING
+  if (t == TOPIC_CMD_RECORD && val == 1 && !isRecording) {
+    isRecording = true;
+    recordStartTime = millis();
+    lastRecordSample = 0;
+    recCount = 0;
+    return;
+  }
+
+  // 🔥 MQTT TÜRSTEHER (Sichert deine perfekten Werte) 🔥
+  if (t == TOPIC_CFG_PEAKGATE) {
+    if (val >= 1000 && val <= 10000) {
+      peakGate = val;
+      publishStatus();
+    }
+  } else if (t == TOPIC_CFG_TFNEED) {
+    if (val >= 1 && val <= 10) {
+      tfNeed = val;
+      publishStatus();
+    }
   }
 }
 
 static void mqttEnsure() {
-  if (!wifiOk()) return;
-  if (mqttOk()) return;
-
+  if (!wifiOk() || mqttOk()) return;
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  String clientId = "doorbell-trig-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-  mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS);
-}
+  String clientId = "doorbell-" + String((uint32_t)ESP.getEfuseMac(), HEX);
 
-static void publishTrig(int32_t peak,
-                        float b1, float b2, float b3,
-                        float ratio, int tf,
-                        float best, float second, float dom, float pk, float bestF) {
-  if (!mqttOk()) return;
-  char buf[256];
-  snprintf(buf, sizeof(buf),
-           "{\"trigger\":1,\"peak\":%ld,\"b1\":%.0f,\"b2\":%.0f,\"b3\":%.0f,\"ratio\":%.2f,\"tf\":%d,\"bestF\":%.0f,\"best\":%.0f,\"second\":%.0f,\"dom\":%.2f,\"pk\":%.2f}",
-           (long)peak, b1, b2, b3, ratio, tf, bestF, best, second, dom, pk);
-  mqtt.publish(TOPIC_EVENT, buf, false);
-}
-
-static void publishStatus(int32_t peak, float best, float second, float dom, float pk, float bestF) {
-  if (!mqttOk()) return;
-  char buf[512];
-  snprintf(buf, sizeof(buf),
-           "{\"online\":1,"
-           "\"peakGate\":%ld,\"bandDomMin\":%.2f,\"bandRatioMin\":%.2f,\"tfNeed\":%d,\"cool\":%u,\"shift\":%d,"
-           "\"domThr\":%.2f,\"peakThr\":%.2f,\"cooldownMs\":%u,"
-           "\"peak\":%ld,\"bestF\":%.0f,\"best\":%.0f,\"second\":%.0f,\"dom\":%.2f,\"pk\":%.2f,"
-           "\"ip\":\"%s\"}",
-           (long)peakGate, domThr, peakThr, tfNeed, (unsigned)cooldownMs, SHIFT,
-           domThr, peakThr, (unsigned)cooldownMs,
-           (long)peak, bestF, best, second, dom, pk,
-           wifiOk()?WiFi.localIP().toString().c_str():"--");
-  mqtt.publish(TOPIC_STATUS, buf, true);
+  if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS)) {
+    mqtt.subscribe(TOPIC_CFG_PEAKGATE);
+    mqtt.subscribe(TOPIC_CFG_TFNEED);
+    mqtt.subscribe(TOPIC_CMD_RECORD);
+    publishStatus(); // Sofort korrekte Werte an ioBroker melden
+  }
 }
 
 // ===================== I2S =====================
@@ -154,7 +216,7 @@ static void i2sSetup() {
   cfg.communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_STAND_I2S;
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   cfg.dma_buf_count = 8;
-  cfg.dma_buf_len   = N;
+  cfg.dma_buf_len = N;
 
   i2s_pin_config_t pin = {};
   pin.bck_io_num = I2S_SCK;
@@ -165,172 +227,163 @@ static void i2sSetup() {
   i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
   i2s_set_pin(I2S_PORT, &pin);
   i2s_set_clk(I2S_PORT, (uint32_t)FS, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_MONO);
-  i2s_zero_dma_buffer(I2S_PORT);
   i2s_start(I2S_PORT);
 }
 
-// ===================== Web: quick tuning =====================
-// /set?pg=500&dom=1.8&pk=0.28&cd=1200
-static void handleSet() {
-  if (server.hasArg("pg"))  peakGate = server.arg("pg").toInt();
-  if (server.hasArg("dom")) domThr   = server.arg("dom").toFloat();
-  if (server.hasArg("pk"))  peakThr  = server.arg("pk").toFloat();
-  if (server.hasArg("cd"))  cooldownMs = (uint32_t)server.arg("cd").toInt();
-
-  String s = "OK ";
-  s += "pg=" + String((long)peakGate);
-  s += " dom=" + String(domThr, 2);
-  s += " pk=" + String(peakThr, 2);
-  s += " cd=" + String((unsigned)cooldownMs);
-  server.send(200, "text/plain", s);
-}
-
-static void handleStatus() {
-  String s = "{";
-  s += "\"wifi\":" + String(wifiOk()?1:0) + ",";
-  s += "\"mqtt\":" + String(mqttOk()?1:0) + ",";
-  s += "\"peakGate\":" + String((long)peakGate) + ",";
-  s += "\"domThr\":" + String(domThr, 2) + ",";
-  s += "\"peakThr\":" + String(peakThr, 2) + ",";
-  s += "\"cooldownMs\":" + String((unsigned)cooldownMs);
-  s += "}";
-  server.send(200, "application/json", s);
-}
-
-// ===================== OLED draw =====================
-static void oledDraw(int32_t peak, bool loud, float bestF, float dom, float pk, bool tonalOk, bool trig) {
+// ===================== OLED ANIMATIONEN =====================
+static void drawBellAnimation() {
   display.clearDisplay();
+
+  int cx = 64;
+  int cy = 28;
+
+  int swing = sin(millis() / 50.0) * 12;
+
+  if ((millis() / 150) % 2 == 0) {
+    display.drawCircle(cx, cy + 4, 30, SSD1306_WHITE);
+    display.drawCircle(cx, cy + 4, 35, SSD1306_WHITE);
+    display.drawCircle(cx, cy + 4, 40, SSD1306_WHITE);
+  }
+
+  display.fillRect(cx - 24, 0, 49, 64, SSD1306_BLACK);
+  display.fillCircle(cx + swing, cy + 24, 7, SSD1306_WHITE);
+
+  display.fillCircle(cx, cy, 18, SSD1306_WHITE);
+  display.fillRect(cx - 18, cy, 37, 16, SSD1306_WHITE);
+  display.fillRoundRect(cx - 24, cy + 12, 49, 10, 4, SSD1306_WHITE);
+  display.drawCircle(cx, cy - 22, 4, SSD1306_WHITE);
+
+  display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
-
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.print("peak:");
-  display.print((long)peak);
-  display.print(" pg:");
-  display.print((long)peakGate);
-
-  display.setCursor(0, 12);
-  display.print("F:");
-  if (bestF > 0) display.print((int)bestF); else display.print("--");
-  display.print(" dom:");
-  display.print(dom, 2);
-
-  display.setCursor(0, 24);
-  display.print("pk:");
-  display.print(pk, 2);
-  display.print(" thr:");
-  display.print(peakThr, 2);
-
-  display.setCursor(0, 36);
-  display.print("loud:");
-  display.print(loud ? 1 : 0);
-  display.print(" tonal:");
-  display.print(tonalOk ? 1 : 0);
-
-  display.setCursor(0, 48);
-  display.print("WiFi:");
-  display.print(wifiOk() ? "OK" : "--");
-  display.print(" MQTT:");
-  display.print(mqttOk() ? "OK" : "--");
-
-  if (trig) {
-    display.setTextSize(2);
-    display.setCursor(64, 44);
-    display.print("TR");
+  if ((millis() / 250) % 2 == 0) {
+    display.setCursor(2, 2);
+    display.print("DING");
+  } else {
+    display.setCursor(76, 48);
+    display.print("DONG");
   }
 
   display.display();
 }
 
-// ===================== Setup / Loop =====================
-void setup() {
-  Serial.begin(115200);
-  delay(200);
+static void oledDrawNormal() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
 
-  // precompute bins
-  for (int i = 0; i < FCNT; i++) bins[i] = makeBin(F[i]);
+  display.setCursor(0, 0);
+  display.printf("Vol:%4ld Gate:%ld", (long)lastPeak, (long)peakGate);
+  display.setCursor(0, 12);
+  display.printf("Hz: %4.0f Dom:%.1f", lastBestF, lastDom);
 
-  // OLED init
-  Wire.begin(I2C_SDA, I2C_SCL);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("SSD1306 init failed");
-  } else {
-    display.clearDisplay();
-    display.display();
+  if (isRecording) {
+    display.fillRect(100, 16, 28, 14, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setCursor(105, 19);
+    display.print("REC");
   }
 
-  // I2S
-  i2sSetup();
+  int barWidth = 10;
+  int startX = 10;
+  float maxMag = 0.1f;
+  for (int i = 0; i < FCNT; i++) if (mags[i] > maxMag) maxMag = mags[i];
 
-  // Networking
-  wifiEnsure();
-  server.on("/set", handleSet);
-  server.on("/status", handleStatus);
-  server.begin();
+  for (int i = 0; i < FCNT; i++) {
+    int barHeight = (int)((mags[i] / maxMag) * 25.0f);
+    if (barHeight > 25) barHeight = 25;
+    if (barHeight < 1) barHeight = 1;
+    display.fillRect(startX + (i * 12), 64 - barHeight, barWidth, barHeight, SSD1306_WHITE);
+  }
 
-  mqtt.setBufferSize(512);
+  display.display();
 }
 
-void loop() {
-  // Web
-  server.handleClient();
-
-  // WiFi: try only every 2s (no spam)
-  static uint32_t lastWifiTry = 0;
-  if (!wifiOk() && millis() - lastWifiTry > 2000) {
-    lastWifiTry = millis();
-    wifiEnsure();
-  }
-
-  // MQTT: try only every 2s
-  static uint32_t lastMqttTry = 0;
-  if (wifiOk() && !mqttOk() && millis() - lastMqttTry > 2000) {
-    lastMqttTry = millis();
-    mqttEnsure();
-  }
-  if (mqttOk()) mqtt.loop();
-
-  // read audio
+// ===================== DSP Analyse =====================
+static void analyzeAudio() {
   size_t bytesRead = 0;
   if (i2s_read(I2S_PORT, rawBuf, sizeof(rawBuf), &bytesRead, pdMS_TO_TICKS(300)) != ESP_OK) return;
   if ((int)(bytesRead / 4) < N) return;
 
   int32_t peak = 0;
+  float rms = 0.0f;
+
   for (int i = 0; i < N; i++) {
     int32_t v = rawBuf[i] >> SHIFT;
     xBuf[i] = v;
+
     int32_t a = (v >= 0) ? v : -v;
     if (a > peak) peak = a;
+
+    rms += (float)v * v;
   }
 
-  bool loud = (peak >= peakGate);
+  rms = sqrtf(rms / N);
 
-  // Goertzel: find best/second + sumBand (jetzt über sinnvolle Frequenzen)
   float best = 0.0f, second = 0.0f, sumBand = 0.0f;
   int bestIdx = -1;
 
   for (int i = 0; i < FCNT; i++) {
-    float m = goertzel_mag2(xBuf, bins[i]);
-    sumBand += m;
-    if (m > best) { second = best; best = m; bestIdx = i; }
-    else if (m > second) { second = m; }
+    mags[i] = goertzel_mag2(xBuf, bins[i]);
+    sumBand += mags[i];
+
+    if (mags[i] > best) {
+      second = best;
+      best = mags[i];
+      bestIdx = i;
+    } else if (mags[i] > second) {
+      second = mags[i];
+    }
   }
 
   float bestF = (bestIdx >= 0) ? F[bestIdx] : -1.0f;
-  float dom = (second > 0.0f) ? (best / second) : 999.0f;
-  float pk  = (sumBand > 0.0f) ? (best / sumBand) : 0.0f;
 
-  // tonalOk fließt in Trigger-Entscheidung ein
+  // ===== Klingel-Töne erkennen =====
+  bool isLowTone = (bestIdx == 4 || bestIdx == 3); // 1600 / 1645
+  bool isHighTone = (bestIdx == 7 || bestIdx == 6); // 2065 / 2020
+
+  int tone = 0;
+  if (isLowTone) tone = 1;
+  else if (isHighTone) tone = 2;
+
+  // History speichern
+  toneHistory[tonePos] = tone;
+  tonePos = (tonePos + 1) % 6;
+
+  // 🔥 Stabile Dominanz (Division-by-Zero Schutz)
+  float dom = (second > 1e-6f) ? (best / second) : 50.0f;
+  if (dom > 50.0f) dom = 50.0f;
+
+  float pk = (sumBand > 0.0f) ? (best / sumBand) : 0.0f;
+
+  // 🔥 Crest-Faktor (Crest = Peak / RMS)
+  float crest = (rms > 1e-6f) ? ((float)peak / rms) : 999.0f;
+
+  // 🔥 KORRIGIERT: Ton statt Knall erkennen
+  bool loud = (peak >= peakGate) && (crest < 2.5f);
+
+  // 🔥 Bin-basierte Frequenzprüfung (Ignoriert Sprache 520-580 Hz)
+  bool freqOk = (bestIdx >= 3);
+
   bool tonalOk = (dom >= domThr) && (pk >= peakThr);
 
-  float b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
-  for (int i = 0; i < 3; i++) b1 += goertzel_mag2(xBuf, bins[i]);
-  for (int i = 3; i < 6; i++) b2 += goertzel_mag2(xBuf, bins[i]);
-  for (int i = 6; i < 9; i++) b3 += goertzel_mag2(xBuf, bins[i]);
+  // ===== Pattern prüfen =====
+  bool seenLow = false;
+  bool seenHigh = false;
 
+  for (int i = 0; i < 6; i++) {
+    if (toneHistory[i] == 1) seenLow = true;
+    if (toneHistory[i] == 2) seenHigh = true;
+  }
+
+  bool hasPattern = seenLow && seenHigh;
+
+  // 🔥 Leaky Bucket (Weicher tfStreak)
   static int tfStreak = 0;
-  if (loud && tonalOk) tfStreak++;
-  else tfStreak = 0;
+  if (loud && freqOk && tonalOk && hasPattern) {
+    tfStreak++;
+  } else if (tfStreak > 0) {
+    tfStreak--;
+  }
 
   static uint32_t lastTriggerMs = 0;
   bool cooldownReady = (lastTriggerMs == 0) || (millis() - lastTriggerMs >= cooldownMs);
@@ -338,29 +391,102 @@ void loop() {
 
   if (trig) {
     lastTriggerMs = millis();
-    publishTrig(peak, b1, b2, b3, pk, tfStreak, best, second, dom, pk, bestF);
     tfStreak = 0;
+    lastTrig = true;
+    publishTrig();
   }
 
-  // OLED
+  lastPeak = peak;
+  lastBestF = bestF;
+  lastDom = dom;
+  lastPk = pk;
+
+  // 🔥 RECORDING
+  if (isRecording) {
+    if (millis() - recordStartTime >= 5000) {
+      isRecording = false;
+      sendRecordData();
+    } else {
+      if (millis() - lastRecordSample >= 250) {
+        lastRecordSample = millis();
+        if (recCount < 20) {
+          recs[recCount].peak = peak;
+          recs[recCount].bestF = bestF;
+          recs[recCount].dom = dom;
+          recs[recCount].pk = pk;
+          recs[recCount].tonal = (freqOk && tonalOk);
+          recCount++;
+        }
+      }
+    }
+  }
+}
+
+// ===================== Setup / Loop =====================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  for (int i = 0; i < FCNT; i++) bins[i] = makeBin(F[i]);
+
+  // Turbo I2C (400kHz) für flüssige Animation
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) Serial.println("OLED fail");
+  else {
+    display.clearDisplay();
+    display.display();
+  }
+
+  i2sSetup();
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(2048);
+
+  wifiEnsure();
+}
+
+void loop() {
+  static uint32_t lastNetTry = 0;
+  if (millis() - lastNetTry > 3000) {
+    lastNetTry = millis();
+    wifiEnsure();
+    mqttEnsure();
+  }
+
+  if (mqttOk()) mqtt.loop();
+
+  analyzeAudio();
+
+  // ================= DISPLAY STEUERUNG =================
   static uint32_t lastUi = 0;
-  if (millis() - lastUi > 150) {
+  uint32_t uiDelay = lastTrig ? 40 : 150; // Turbo-FPS bei Animation
+
+  if (millis() - lastUi > uiDelay) {
     lastUi = millis();
-    oledDraw(peak, loud, bestF, dom, pk, tonalOk, trig);
+    if (lastTrig) {
+      drawBellAnimation();
+    } else {
+      oledDrawNormal();
+    }
   }
 
-  // Serial (every 200ms)
-  static uint32_t lastS = 0;
-  if (millis() - lastS > 200) {
-    lastS = millis();
-    Serial.printf("peak=%ld loud=%d bestF=%.0f dom=%.2f pk=%.2f tonal=%d\n",
-                  (long)peak, loud?1:0, bestF, dom, pk, tonalOk?1:0);
-  }
-
-  // status publish (5s) – bleibt hilfreich zum Einpegeln
+  // ================= MQTT STATUS (Alle 5s) =================
   static uint32_t lastStat = 0;
   if (millis() - lastStat > 5000) {
     lastStat = millis();
-    publishStatus(peak, best, second, dom, pk, bestF);
+    publishStatus();
+  }
+
+  // ================= ANIMATIONS TIMER =================
+  static uint32_t trigShownAt = 0;
+  if (lastTrig) {
+    if (trigShownAt == 0) trigShownAt = millis();
+    if (millis() - trigShownAt > 4000) { // 4 Sekunden bimmeln
+      lastTrig = false;
+      trigShownAt = 0;
+    }
+  } else {
+    trigShownAt = 0;
   }
 }
